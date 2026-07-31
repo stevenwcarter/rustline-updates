@@ -1,0 +1,35 @@
+name: Release
+
+# A v* tag builds the wasm and publishes it as a GitHub release with a
+# SHA256SUMS file -- the asset `rustline plugin install` downloads. The asset
+# is named after the plugin (its crate name), NOT the repo: the installed
+# .wasm stem must equal the plugin's exported name().
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch tip
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Build
+        run: cargo build --release --locked --target wasm32-unknown-unknown
+      - name: Stage assets
+        run: |
+          mkdir dist
+          cp target/wasm32-unknown-unknown/release/updates.wasm dist/
+          (cd dist && sha256sum *.wasm > SHA256SUMS)
+      - name: Publish release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          files: dist/*
+          generate_release_notes: true

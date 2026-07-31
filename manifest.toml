@@ -1,0 +1,7 @@
+# Embedded into the built .wasm as the `rustline-manifest` custom section.
+# The default checker only; overriding `program`/`args` needs a matching
+# `rustline plugin cmd add updates "<pattern>"` grant (patterns match the
+# WHOLE canonical argv, not just the program).
+name = "updates"
+version = "0.1.0"
+requested_commands = ["checkupdates"]

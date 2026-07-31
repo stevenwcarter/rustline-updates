@@ -3,5 +3,5 @@
 # `rustline plugin cmd add updates "<pattern>"` grant (patterns match the
 # WHOLE canonical argv, not just the program).
 name = "updates"
-version = "0.1.0"
+version = "0.1.1"
 requested_commands = ["checkupdates"]

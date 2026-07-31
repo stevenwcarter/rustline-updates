@@ -58,22 +58,54 @@ pub fn count_updates(stdout: &str) -> usize {
     stdout.lines().filter(|l| !l.trim().is_empty()).count()
 }
 
-/// State file contents: `"<unix_ts> <count>"` on one line.
-pub fn parse_state(contents: &str) -> Option<(i64, usize)> {
+/// State file contents: `"<unix_ts> <count> <attempt_ts>"` on one line.
+/// `ts`/`count` are the last *successful* run; `attempt_ts` is when a run was
+/// last *tried*, success or not (mirrors the host HTTP/exec caches'
+/// `fetched_at`/`last_attempt_at` split in `rustline-wasm/src/cache.rs`). A
+/// missing third token (a state file written before this field existed) is
+/// total, not a parse failure: `attempt_ts` defaults to `ts`.
+pub fn parse_state(contents: &str) -> Option<(i64, usize, i64)> {
     let mut it = contents.split_whitespace();
     let ts = it.next()?.parse().ok()?;
     let count = it.next()?.parse().ok()?;
-    Some((ts, count))
+    let attempt_ts = match it.next() {
+        Some(tok) => tok.parse().ok()?,
+        None => ts,
+    };
+    Some((ts, count, attempt_ts))
 }
 
-pub fn serialize_state(ts: i64, count: usize) -> String {
-    format!("{ts} {count}\n")
+pub fn serialize_state(ts: i64, count: usize, attempt_ts: i64) -> String {
+    format!("{ts} {count} {attempt_ts}\n")
 }
 
 /// A sample is fresh while `now` is within `ttl` after `ts`; a clock that
 /// moved backwards counts as stale (mirrors the host caches' convention).
 pub fn is_fresh(now: i64, ts: i64, ttl: i64) -> bool {
     now >= ts && now - ts < ttl
+}
+
+/// Should the checker actually run right now? Pure decision, mirroring the
+/// host HTTP/exec caches' retry-at-most-once-per-TTL backoff
+/// (`rustline-wasm/src/cache.rs`'s `last_attempt_at`): a checker that keeps
+/// failing is retried at most once per `ttl`, instead of being re-spawned on
+/// every render tick (each spawn can pin a render up to the host's exec
+/// timeout).
+///
+/// - No persisted state at all (never succeeded) -> always run — nothing to
+///   back off against, same as the host caches' first-fetch behavior.
+/// - The last successful data is still fresh -> don't run; unchanged fast
+///   path.
+/// - Data is stale, but the last *attempt* is still fresh -> don't run; serve
+///   the stale count instead of re-spawning.
+/// - Data is stale AND the last attempt is stale too -> run.
+pub fn should_run_checker(now: i64, state: Option<(i64, usize, i64)>, ttl: i64) -> bool {
+    match state {
+        None => true,
+        Some((ts, _count, attempt_ts)) => {
+            !is_fresh(now, ts, ttl) && !is_fresh(now, attempt_ts, ttl)
+        }
+    }
 }
 
 /// Which format renders a given count, honoring the hide-zero convention.
@@ -177,29 +209,35 @@ mod guest {
             return down_segment(&opts.down_format);
         };
 
-        let persisted = state_read(STATE_FILE)
-            .ok()
-            .filter(|r| r.ok && r.exists)
-            .and_then(|r| parse_state(&r.contents));
+        let persisted = match state_read(STATE_FILE) {
+            Ok(r) if r.ok && r.exists => parse_state(&r.contents),
+            Ok(_) => None,
+            Err(e) => {
+                log(LogLevel::Debug, &format!("updates: state read failed: {e}"));
+                None
+            }
+        };
 
-        let count = match persisted {
-            Some((ts, c)) if is_fresh(now, ts, opts.refresh_secs) => Some(c),
-            _ => match run_checker(&opts) {
+        let count = if should_run_checker(now, persisted, opts.refresh_secs) {
+            match run_checker(&opts) {
                 Some(c) => {
-                    match state_write(STATE_FILE, &serialize_state(now, c)) {
-                        Ok(w) if w.ok => {}
-                        Ok(w) => log(
-                            LogLevel::Warn,
-                            &format!("updates: state write failed: {}", w.error),
-                        ),
-                        Err(e) => log(LogLevel::Warn, &format!("updates: state write failed: {e}")),
-                    }
+                    persist_state(now, c, now);
                     Some(c)
                 }
-                // The checker couldn't run: serve the stale count if any
-                // (the host caches' serve-stale convention), else go down.
-                None => persisted.map(|(_, c)| c),
-            },
+                // The checker couldn't run: serve the stale count if any (the
+                // host caches' serve-stale convention — and, mirroring their
+                // attempt backoff too, re-stamp the attempt time on existing
+                // data so a persistently-failing checker isn't re-spawned on
+                // every render tick until the next refresh window).
+                None => persisted.map(|(ts, c, _attempt_ts)| {
+                    persist_state(ts, c, now);
+                    c
+                }),
+            }
+        } else {
+            // Not due to run: serve the persisted count as-is (fresh data, or
+            // stale data within one attempt-backoff window of the last try).
+            persisted.map(|(_ts, c, _attempt_ts)| c)
         };
 
         match count {
@@ -212,6 +250,18 @@ mod guest {
                 }
             }
             None => down_segment(&opts.down_format),
+        }
+    }
+
+    /// Best-effort state-file write, logging (never panicking) on failure.
+    fn persist_state(ts: i64, count: usize, attempt_ts: i64) {
+        match state_write(STATE_FILE, &serialize_state(ts, count, attempt_ts)) {
+            Ok(w) if w.ok => {}
+            Ok(w) => log(
+                LogLevel::Warn,
+                &format!("updates: state write failed: {}", w.error),
+            ),
+            Err(e) => log(LogLevel::Warn, &format!("updates: state write failed: {e}")),
         }
     }
 
@@ -283,10 +333,23 @@ mod tests {
 
     #[test]
     fn state_round_trips() {
-        let s = serialize_state(1785427200, 42);
-        assert_eq!(parse_state(&s), Some((1785427200, 42)));
+        let s = serialize_state(1785427200, 42, 1785427300);
+        assert_eq!(parse_state(&s), Some((1785427200, 42, 1785427300)));
         assert_eq!(parse_state("garbage"), None);
         assert_eq!(parse_state(""), None);
+    }
+
+    #[test]
+    fn state_parse_accepts_legacy_two_token_form() {
+        // A state file written before the attempt-timestamp field existed:
+        // attempt_ts defaults to ts rather than failing to parse.
+        assert_eq!(
+            parse_state("1785427200 42"),
+            Some((1785427200, 42, 1785427200))
+        );
+        // A malformed third token still fails the whole parse, same as a
+        // malformed first/second token.
+        assert_eq!(parse_state("1785427200 42 garbage"), None);
     }
 
     #[test]
@@ -294,6 +357,30 @@ mod tests {
         assert!(is_fresh(1000, 900, 3600));
         assert!(!is_fresh(5000, 900, 3600));
         assert!(!is_fresh(800, 900, 3600)); // clock went backwards -> stale
+    }
+
+    #[test]
+    fn should_run_checker_cases() {
+        let ttl = 3600;
+        let now = 10_000;
+
+        // No persisted state at all -> always run (nothing to back off
+        // against).
+        assert!(should_run_checker(now, None, ttl));
+
+        // Data fresh -> don't run, regardless of how stale the last attempt
+        // was (ts freshness short-circuits).
+        let data_fresh_attempt_stale = Some((9_500, 5, 100));
+        assert!(!should_run_checker(now, data_fresh_attempt_stale, ttl));
+
+        // Data stale, last attempt fresh -> don't run (the attempt backoff:
+        // serve the stale count instead of re-spawning).
+        let data_stale_attempt_fresh = Some((1_000, 5, 9_000));
+        assert!(!should_run_checker(now, data_stale_attempt_fresh, ttl));
+
+        // Data stale AND last attempt stale -> run.
+        let data_stale_attempt_stale = Some((1_000, 5, 1_000));
+        assert!(should_run_checker(now, data_stale_attempt_stale, ttl));
     }
 
     #[test]

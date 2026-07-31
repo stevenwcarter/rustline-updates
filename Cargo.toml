@@ -1,0 +1,40 @@
+# Empty [workspace] table: this plugin builds standalone for wasm32 and is
+# NOT a member of any parent Cargo workspace. Declaring its own workspace
+# root here stops cargo from climbing ancestor directories looking for one,
+# which otherwise breaks a build when this crate ends up nested inside
+# another workspace (e.g. a git worktree whose outer Cargo.toml doesn't list
+# this deeper path in `exclude`).
+[workspace]
+
+[package]
+name = "updates"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+# This plugin's pure logic (unit-tested on the host via `cargo test`) needs no
+# dependencies by default; add serde/serde_json/etc. under `[dependencies]`
+# here if your logic needs them.
+
+# Guest bindings only compile for the wasm target; `cargo test` on the host
+# builds just the pure logic in src/lib.rs.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# `extism-pdk` supplies the exports the SDK's `export_plugin!` macro emits.
+extism-pdk = "1"
+# The rustline plugin SDK: typed host-capability wrappers (`http_get`,
+# `state_read`, …), the shared wire types (`GuestRender`/`WireContext`/
+# `Segment`/…), a click-toggle helper, and the `export_plugin!` macro — so this
+# plugin depends on one crate rather than hand-rolling the Extism glue.
+#
+# In-tree (scaffolded inside rustline's own `plugins/` directory): use the
+# path dependency below, adjusting the relative path if you scaffolded
+# elsewhere in the checkout.
+#
+# Standalone repo (out-of-tree): replace it with the git dependency pinned to
+# a rustline release tag — see the rustline-pubip / rustline-ticker /
+# rustline-kube / rustline-updates repos for complete worked examples:
+#
+#   rustline-plugin-sdk = { git = "https://github.com/stevenwcarter/rustline", tag = "v0.1.0" }
+rustline-plugin-sdk = { path = "../../crates/rustline-plugin-sdk" }
